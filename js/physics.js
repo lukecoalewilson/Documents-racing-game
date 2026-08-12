@@ -43,7 +43,7 @@ const PHYSICS = {
   ROLLING_RESISTANCE: 90,     // constant friction (px/s^2) that kills coasting speed
 
   // --- Steering ---
-  TURN_RATE: 3.0,             // max yaw rate (radians/sec) achievable at TURN_SPEED_REF
+  TURN_RATE: 3.45,            // max yaw rate (radians/sec) achievable at TURN_SPEED_REF
   TURN_SPEED_REF: 140,        // speed (px/s) at which steering reaches full TURN_RATE
   MIN_SPEED_TO_STEER: 6,      // below this speed (px/s), steering input has no effect
   HIGH_SPEED_STEER_FALLOFF: 0.6, // steering authority multiplier retained at MAX_SPEED (<1 = safer at top speed)
@@ -60,6 +60,8 @@ const PHYSICS = {
   WALL_BOUNCE: 0.35,          // fraction of into-wall velocity reflected back out
   WALL_SPEED_SCRUB: 0.55,     // max fraction of speed lost on a fully head-on wall hit
                               // (a shallow scrape scrubs proportionally less)
+  CAR_RESTITUTION: 0.30,      // bounciness of car-to-car contact
+  CAR_CONTACT_SCRUB: 0.985,   // speed retained by both cars after a nudge
 };
 
 function clamp(value, min, max) {
@@ -168,6 +170,41 @@ function collideCarWithTrack(car, oldX, oldY, track) {
   }
 
   car.speed = Math.hypot(car.vx, car.vy);
+}
+
+// --- car-to-car collision ---------------------------------------------------
+
+// Equal-mass circle collision: push the pair apart out of overlap, then
+// exchange an impulse along the contact normal so they shove each other
+// instead of passing through. Applies to every car equally — the AI has no
+// special case here.
+function resolveCarCollisions(cars) {
+  const minDist = PHYSICS.CAR_RADIUS * 2;
+  for (let i = 0; i < cars.length; i++) {
+    for (let j = i + 1; j < cars.length; j++) {
+      const a = cars[i], b = cars[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let d = Math.hypot(dx, dy);
+      if (d >= minDist) continue;
+      if (d < 1e-6) { dx = 1; dy = 0; d = 1e-6; }
+
+      const nx = dx / d, ny = dy / d;
+      const overlap = (minDist - d) / 2;
+      a.x -= nx * overlap; a.y -= ny * overlap;
+      b.x += nx * overlap; b.y += ny * overlap;
+
+      const rvn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      if (rvn >= 0) continue; // already separating
+      const impulse = -(1 + PHYSICS.CAR_RESTITUTION) * rvn / 2;
+      a.vx -= impulse * nx; a.vy -= impulse * ny;
+      b.vx += impulse * nx; b.vy += impulse * ny;
+
+      a.vx *= PHYSICS.CAR_CONTACT_SCRUB; a.vy *= PHYSICS.CAR_CONTACT_SCRUB;
+      b.vx *= PHYSICS.CAR_CONTACT_SCRUB; b.vy *= PHYSICS.CAR_CONTACT_SCRUB;
+      a.speed = Math.hypot(a.vx, a.vy);
+      b.speed = Math.hypot(b.vx, b.vy);
+    }
+  }
 }
 
 class Car {

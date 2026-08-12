@@ -1,91 +1,170 @@
 // ============================================================================
 // RENDER.JS — All canvas drawing. Everything is primitives; no images.
 //
-// CAMERA: fixed. The whole circuit is scaled and centred to fit the canvas,
-// with the zoom derived from the track's bounding box, so editing the layout
-// in track.js automatically refits. Nothing scrolls.
+// CAMERA: fixed zoom, panning follow. The zoom is derived from the track's
+// bounding box so roughly CAMERA.VISIBLE_FRACTION of the circuit is on screen
+// at once, and it never changes. The camera only pans, and only when the car
+// pushes out of a deadzone rectangle in the middle of the screen — inside the
+// deadzone the view is completely still, so the car drags the view rather
+// than the view chasing the car. Panning is smoothed and clamped to the track
+// bounds so empty space outside the circuit never comes into view.
 //
-// The static parts of the world (ground, tarmac, kerbs, barriers, start line)
-// are pre-rendered once into an offscreen layer at display resolution, so a
-// frame costs one blit plus the cars.
+// The static world (ground, tarmac, kerbs, barriers, start line) is
+// pre-rendered once into an offscreen layer, so a frame costs one blit plus
+// the cars.
 // ============================================================================
 
-// --- Colour palette. Calm and low-contrast by design: the cars are meant to
-// --- be the brightest, most saturated things on screen.
+// --- Colour palette. Calm and low-contrast, apart from the kerbs and cars.
 const PALETTE = {
   ground:        '#232a29',              // surrounding grass / infield
   groundSpeckle: 'rgba(255,255,255,0.014)',
   surface:       '#414a52',              // tarmac — slightly darker than the barriers
   surfaceSeam:   'rgba(206,220,230,0.07)', // faint centreline dashes
-  edgeLine:      'rgba(198,214,226,0.26)', // thin lighter line marking the track edge
+  edgeLine:      'rgba(198,214,226,0.30)', // plain edge line, used on straights
   barrier:       '#6d7f90',              // muted grey-blue barrier
   barrierEdge:   'rgba(28,34,40,0.35)',  // slight darkening under the barrier for depth
-  kerbRed:       '#8a5c58',              // desaturated red, low contrast against...
-  kerbPale:      '#8d979e',              // ...this muted grey
-  startPale:     '#9aa6ae',              // kept dimmer than the cars on purpose
+  kerbRed:       '#c4342f',              // proper red/white kerbing, corners only
+  kerbWhite:     '#e6e8e9',
+  startPale:     '#9aa6ae',
   startDark:     '#3b444b',
 };
 
-// Kerbs only appear where the track is genuinely cornering: anywhere the
-// radius is tighter than this, on the inside of the bend.
-const KERB_MIN_RADIUS = 400;   // px — larger value = kerbs on more of the lap
-const KERB_WIDTH = 17;         // px, world space
-const KERB_STRIPE_POINTS = 6;  // centreline samples per stripe (wider = calmer)
-const EDGE_LINE_INSET = 15;    // px inboard of the barrier
+// --- Camera tuning -----------------------------------------------------------
+const CAMERA = {
+  // How much of the circuit is on screen: the viewport spans this fraction of
+  // the track's bounding box along whichever axis is tighter. Lower = more
+  // zoomed in. The zoom is derived from this once and then never changes.
+  //
+  // This trades directly against the deadzone. The camera's total pan travel
+  // is (1 - VIEWPORT_FRACTION)/2 of the track, while the deadzone is
+  // DEADZONE_W/2 of the viewport — so the car can only ever push the camera
+  // when the former is comfortably larger than the latter. On this circuit
+  // (bounds 3169x1810) anything above ~0.62 leaves the camera frozen: at 0.84
+  // — which is "70% of the circuit visible" by area — the deadzone is +/-799px
+  // against only +/-254px of available travel. 0.50 keeps a real pan range.
+  VIEWPORT_FRACTION: 0.50,
+  // Deadzone rectangle as a fraction of the canvas. While the car is inside
+  // it the camera does not move at all.
+  DEADZONE_W: 0.60,
+  DEADZONE_H: 0.60,
+  // Pan smoothing. Higher = the camera catches up to the deadzone edge
+  // faster. Framerate-independent.
+  SMOOTHING: 7.0,
+};
 
-// Car dimensions in world px. Sized so the car stays readable at the
-// fit-to-screen zoom while still leaving room for four abreast on a
-// 150px-wide track.
+// --- Kerbs: red/white, corners only, wide stripes so they don't strobe when
+// --- the camera pans. Straights get the plain edge line instead.
+// Radius threshold for "this is a corner". The circuit's genuine corners run
+// from 166px (final hairpin) up to about 700px; the fast sweeps sit at
+// 700-1300 and the main straight is 2500+. 700 puts kerbing on the parts
+// where the car actually has to be placed, and leaves the quick sweepers and
+// the straight with the plain edge line.
+const KERB_MIN_RADIUS = 700;    // px — corners tighter than this get kerbing
+const KERB_WIDTH = 15;          // px, world space
+const KERB_STRIPE_LENGTH = 105; // px of track per stripe — deliberately long
+const EDGE_LINE_INSET = 13;     // px inboard of the barrier
+
+// Car dimensions in world px, sized to stay readable at the camera's zoom.
 const CAR_LENGTH = 56;
 const CAR_WIDTH = 28;
+
+// Cap on the pre-rendered layer's resolution, to bound memory on big displays.
+const MAX_LAYER_DIMENSION = 4096;
 
 const Render = {
   ctx: null,
   canvas: null,
-  trackLayer: null,                        // offscreen canvas, display resolution
-  view: { scale: 1, offsetX: 0, offsetY: 0 },
-  margin: 18,                              // CSS px of breathing room around the track
+  trackLayer: null,
+  layerScale: 1,
+  view: { scale: 1 },
+  camera: { x: 0, y: 0 },
+  viewport: { halfW: 0, halfH: 0 }, // half the visible world size, in world px
 
   init(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
   },
 
-  // ---- fixed camera --------------------------------------------------------
+  // ---- camera --------------------------------------------------------------
 
-  // Size the canvas to its container and refit the track. Call on load and
-  // whenever the window resizes.
+  // Size the canvas to its container and recompute zoom. Call on load and
+  // whenever the window resizes. The zoom depends only on the track and the
+  // canvas, never on where the car is.
   resize(track) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const cssW = this.canvas.clientWidth || window.innerWidth;
     const cssH = this.canvas.clientHeight || window.innerHeight;
     this.canvas.width = Math.max(1, Math.round(cssW * dpr));
     this.canvas.height = Math.max(1, Math.round(cssH * dpr));
-    this.computeView(track, dpr);
+
+    const b = track.bounds;
+    // Zoom that would show the whole circuit, then zoomed in so the viewport
+    // spans only VIEWPORT_FRACTION of it.
+    const fitScale = Math.min(this.canvas.width / b.width, this.canvas.height / b.height);
+    this.view.scale = fitScale / CAMERA.VIEWPORT_FRACTION;
+
+    this.viewport.halfW = this.canvas.width / 2 / this.view.scale;
+    this.viewport.halfH = this.canvas.height / 2 / this.view.scale;
+
+    this.clampCamera(track);
     this.renderTrackLayer(track);
   },
 
-  // Derive zoom and centring from the track's bounding box so any layout fits.
-  computeView(track, dpr) {
-    const b = track.bounds;
-    const m = this.margin * dpr;
-    const availW = this.canvas.width - m * 2;
-    const availH = this.canvas.height - m * 2;
-    const scale = Math.min(availW / b.width, availH / b.height);
-    this.view.scale = scale;
-    this.view.offsetX = (this.canvas.width - b.width * scale) / 2 - b.minX * scale;
-    this.view.offsetY = (this.canvas.height - b.height * scale) / 2 - b.minY * scale;
+  // Put the camera straight onto a point, with no smoothing (used on restart).
+  snapCameraTo(track, x, y) {
+    this.camera.x = x;
+    this.camera.y = y;
+    this.clampCamera(track);
   },
 
-  // Apply the world→screen transform to a context.
-  applyWorldTransform(ctx) {
-    const v = this.view;
-    ctx.setTransform(v.scale, 0, 0, v.scale, v.offsetX, v.offsetY);
+  // Deadzone pan: the camera target only changes once the car has pushed past
+  // the deadzone boundary, and then only far enough to hold it on that edge.
+  updateCamera(track, car, dt) {
+    const cam = this.camera;
+    const scale = this.view.scale;
+    const dzX = this.canvas.width * CAMERA.DEADZONE_W / 2 / scale;  // world px
+    const dzY = this.canvas.height * CAMERA.DEADZONE_H / 2 / scale;
+
+    let targetX = cam.x, targetY = cam.y;
+    const offX = car.x - cam.x, offY = car.y - cam.y;
+    if (offX > dzX) targetX = car.x - dzX;
+    else if (offX < -dzX) targetX = car.x + dzX;
+    if (offY > dzY) targetY = car.y - dzY;
+    else if (offY < -dzY) targetY = car.y + dzY;
+
+    const k = 1 - Math.exp(-CAMERA.SMOOTHING * dt); // framerate-independent lerp
+    cam.x += (targetX - cam.x) * k;
+    cam.y += (targetY - cam.y) * k;
+
+    this.clampCamera(track);
   },
+
+  // Keep the visible rectangle inside the track's bounds. If the viewport is
+  // wider than the track on an axis (very unusual window shape), centre it on
+  // that axis instead of clamping.
+  clampCamera(track) {
+    const b = track.bounds;
+    const cam = this.camera;
+    const { halfW, halfH } = this.viewport;
+    cam.x = (halfW * 2 >= b.width)
+      ? (b.minX + b.maxX) / 2
+      : clamp(cam.x, b.minX + halfW, b.maxX - halfW);
+    cam.y = (halfH * 2 >= b.height)
+      ? (b.minY + b.maxY) / 2
+      : clamp(cam.y, b.minY + halfH, b.maxY - halfH);
+  },
+
+  worldToScreenX(x) { return (x - this.camera.x) * this.view.scale + this.canvas.width / 2; },
+  worldToScreenY(y) { return (y - this.camera.y) * this.view.scale + this.canvas.height / 2; },
 
   beginWorld() {
+    const s = this.view.scale;
     this.ctx.save();
-    this.applyWorldTransform(this.ctx);
+    this.ctx.setTransform(
+      s, 0, 0, s,
+      this.canvas.width / 2 - this.camera.x * s,
+      this.canvas.height / 2 - this.camera.y * s
+    );
   },
 
   endWorld() {
@@ -95,22 +174,29 @@ const Render = {
   // ---- static world pre-render --------------------------------------------
 
   renderTrackLayer(track) {
-    const w = this.canvas.width, h = this.canvas.height;
+    const b = track.bounds;
+    // Render at display scale where possible, backing off on huge displays.
+    this.layerScale = Math.min(
+      this.view.scale,
+      MAX_LAYER_DIMENSION / b.width,
+      MAX_LAYER_DIMENSION / b.height
+    );
+    const s = this.layerScale;
+
     const layer = document.createElement('canvas');
-    layer.width = w;
-    layer.height = h;
+    layer.width = Math.max(1, Math.ceil(b.width * s));
+    layer.height = Math.max(1, Math.ceil(b.height * s));
     const ctx = layer.getContext('2d');
 
-    // Ground, in screen space so it always covers the canvas.
     ctx.fillStyle = PALETTE.ground;
-    ctx.fillRect(0, 0, w, h);
+    ctx.fillRect(0, 0, layer.width, layer.height);
     ctx.fillStyle = PALETTE.groundSpeckle;
-    for (let i = 0; i < 1600; i++) {
-      ctx.fillRect(Math.random() * w, Math.random() * h, 2, 2);
+    for (let i = 0; i < 2600; i++) {
+      ctx.fillRect(Math.random() * layer.width, Math.random() * layer.height, 2, 2);
     }
 
-    ctx.save();
-    this.applyWorldTransform(ctx);
+    // World space, with the layer's top-left at (bounds.minX, bounds.minY).
+    ctx.setTransform(s, 0, 0, s, -b.minX * s, -b.minY * s);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'butt';
 
@@ -132,72 +218,63 @@ const Render = {
     tracePath(track.centerline);
     ctx.strokeStyle = PALETTE.surfaceSeam;
     ctx.lineWidth = 3;
-    ctx.setLineDash([20, 34]);
+    ctx.setLineDash([22, 36]);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    this.drawKerbs(ctx, track);
-    this.drawEdgeLines(ctx, track);
+    this.drawTrackEdges(ctx, track);
     this.drawBarriers(ctx, track);
     this.drawStartLine(ctx, track);
 
-    ctx.restore();
     this.trackLayer = layer;
   },
 
-  // Kerbs run along the INSIDE of corners only — the side the track curves
-  // toward. track.curvature is signed: positive turns toward the normal
-  // (driver's right), negative toward the left.
-  drawKerbs(ctx, track) {
-    const cl = track.centerline, nrm = track.normals, curv = track.curvature;
+  // Kerbs through the corners, plain edge line down the straights. A point
+  // counts as "corner" when the centreline radius is tighter than
+  // KERB_MIN_RADIUS; both edges get kerbed there, as on a real circuit.
+  drawTrackEdges(ctx, track) {
+    const cl = track.centerline, nrm = track.normals;
+    const curv = track.curvature, hw = track.halfWidths, arc = track.arc;
     const count = cl.length;
     const threshold = 1 / KERB_MIN_RADIUS;
-    const offset = track.halfW - KERB_WIDTH / 2;
+    const isCorner = (i) => Math.abs(curv[i]) >= threshold;
 
-    ctx.lineWidth = KERB_WIDTH;
-    ctx.lineCap = 'butt';
-
-    for (let i = 0; i < count; i++) {
-      const k = curv[i];
-      if (Math.abs(k) < threshold) continue;
-      const side = k > 0 ? 1 : -1; // +1 = driver's right, -1 = driver's left
-      const j = (i + 1) % count;
-      // Both endpoints use side from point i, so a left/right transition just
-      // ends one kerb and starts the other — it never draws across the track.
-      const ax = cl[i].x + nrm[i].x * offset * side;
-      const ay = cl[i].y + nrm[i].y * offset * side;
-      const bx = cl[j].x + nrm[j].x * offset * side;
-      const by = cl[j].y + nrm[j].y * offset * side;
-
-      ctx.strokeStyle = Math.floor(i / KERB_STRIPE_POINTS) % 2 === 0
-        ? PALETTE.kerbRed : PALETTE.kerbPale;
-      ctx.beginPath();
-      ctx.moveTo(ax, ay);
-      ctx.lineTo(bx, by);
-      ctx.stroke();
-    }
-  },
-
-  // Thin lighter line just inboard of each barrier.
-  drawEdgeLines(ctx, track) {
-    const cl = track.centerline, nrm = track.normals;
-    const offset = track.halfW - EDGE_LINE_INSET;
+    // Plain edge line, drawn only along the straights.
     ctx.strokeStyle = PALETTE.edgeLine;
     ctx.lineWidth = 2.5;
     for (const side of [1, -1]) {
+      let drawing = false;
       ctx.beginPath();
-      for (let i = 0; i < cl.length; i++) {
-        const x = cl[i].x + nrm[i].x * offset * side;
-        const y = cl[i].y + nrm[i].y * offset * side;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      for (let i = 0; i <= count; i++) {
+        const idx = i % count;
+        if (isCorner(idx)) { drawing = false; continue; }
+        const off = (hw[idx] - EDGE_LINE_INSET) * side;
+        const x = cl[idx].x + nrm[idx].x * off;
+        const y = cl[idx].y + nrm[idx].y * off;
+        if (!drawing) { ctx.moveTo(x, y); drawing = true; } else { ctx.lineTo(x, y); }
       }
-      ctx.closePath();
       ctx.stroke();
+    }
+
+    // Red/white kerbs through the corners. Stripe index comes from arc length
+    // so stripes stay a consistent, deliberately long size all the way round.
+    ctx.lineWidth = KERB_WIDTH;
+    for (const side of [1, -1]) {
+      for (let i = 0; i < count; i++) {
+        if (!isCorner(i)) continue;
+        const j = (i + 1) % count;
+        const offI = (hw[i] - KERB_WIDTH / 2) * side;
+        const offJ = (hw[j] - KERB_WIDTH / 2) * side;
+        ctx.strokeStyle = Math.floor(arc[i] / KERB_STRIPE_LENGTH) % 2 === 0
+          ? PALETTE.kerbRed : PALETTE.kerbWhite;
+        ctx.beginPath();
+        ctx.moveTo(cl[i].x + nrm[i].x * offI, cl[i].y + nrm[i].y * offI);
+        ctx.lineTo(cl[j].x + nrm[j].x * offJ, cl[j].y + nrm[j].y * offJ);
+        ctx.stroke();
+      }
     }
   },
 
-  // Solid muted grey-blue barriers, with a soft dark line under them so the
-  // wall reads as raised without adding contrast.
   drawBarriers(ctx, track) {
     for (const pts of [track.wallRight, track.wallLeft]) {
       ctx.beginPath();
@@ -215,7 +292,6 @@ const Render = {
     }
   },
 
-  // Muted checkered strip across the track at gate 0.
   drawStartLine(ctx, track) {
     const g = track.gates[0];
     const across = Math.hypot(g.bx - g.ax, g.by - g.ay);
@@ -233,14 +309,24 @@ const Render = {
     ctx.restore();
   },
 
-  drawTrack() {
-    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.drawImage(this.trackLayer, 0, 0);
+  // Blit the pre-rendered world at the current camera position.
+  drawTrack(track) {
+    const ctx = this.ctx;
+    const b = track.bounds;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = PALETTE.ground;
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.drawImage(
+      this.trackLayer,
+      0, 0, this.trackLayer.width, this.trackLayer.height,
+      this.worldToScreenX(b.minX), this.worldToScreenY(b.minY),
+      b.width * this.view.scale, b.height * this.view.scale
+    );
   },
 
   // ---- dynamic objects (call between beginWorld/endWorld) ------------------
 
-  drawCar(car, bodyColor = '#ff5a4d', accentColor = '#f4f8fa') {
+  drawCar(car, bodyColor = '#ff5a4d', accentColor = '#f4f8fa', highlight = false) {
     const ctx = this.ctx;
     const w = CAR_LENGTH;
     const h = CAR_WIDTH;
@@ -268,6 +354,13 @@ const Render = {
     ctx.beginPath();
     ctx.roundRect(-w / 2, -h / 2, w, h, 7);
     ctx.fill();
+
+    // the player's car gets a bright outline so it is findable in traffic
+    if (highlight) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
 
     // cockpit
     ctx.fillStyle = accentColor;

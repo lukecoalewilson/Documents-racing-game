@@ -1,31 +1,78 @@
 // ============================================================================
 // TRACK.JS — The circuit, defined as DATA: a list of centreline control
-// points plus a width. Everything else (smooth centreline, barriers, wall
-// collision segments, curvature, checkpoint gates, bounding box, start pose)
-// is derived from that, so you reshape the track by editing TRACK_DATA only.
+// points (each with its own track width) smoothed into a closed loop.
+// Everything else — barriers, wall collision segments, curvature, checkpoint
+// gates, bounding box, start pose — is derived from that, so you reshape the
+// circuit by editing TRACK_DATA only. The AI racing line in ai.js is derived
+// from this same data, so it re-derives itself whenever the layout changes.
 //
-// Layout notes: control points are smoothed with a Catmull-Rom spline, so
-// the drawn centreline passes THROUGH every point. Points are world-space
-// pixels, y grows downward. Keep corner radii comfortably larger than
-// width/2 or the inner barrier will pinch.
+// Control point format: [x, y, width]. Width is optional and falls back to
+// defaultWidth; it is interpolated smoothly between points, so make fast
+// sections wide and technical sections narrow. Points are world-space pixels,
+// y grows downward. Keep corner radii comfortably larger than width/2 or the
+// inner barrier will pinch shut.
 // ============================================================================
 
 // Race length. This is the only place the lap count is defined.
 const RACE_LAPS = 5;
 
 const TRACK_DATA = {
-  width: 150,           // track surface width (px). Barriers sit at ±width/2.
-  checkpointCount: 12,  // invisible ordered gates (gate 0 = start/finish line)
+  defaultWidth: 150,
+  checkpointCount: 16,  // invisible ordered gates (gate 0 = start/finish line)
 
-  // Centreline control points. Current layout: bottom start/finish straight
-  // (heading +x) → fast right-hand sweeper → top straight with a kink →
-  // tight left hairpin → short chicane back to the straight.
   controlPoints: [
-    [800, 1700], [1500, 1730], [2150, 1650],   // start/finish straight
-    [2700, 1420], [2950, 950], [2690, 500],    // fast sweeper (big radius)
-    [2100, 330], [1450, 390], [950, 300],      // top straight + kink
-    [530, 440], [310, 570], [310, 820], [545, 945], // tight hairpin (two apex points keep the U round)
-    [680, 1240], [635, 1480],                  // chicane link back to start
+    // --- Start/finish straight: long, wide, heading +x (~1800px to build speed)
+    [820, 2150, 176],
+    [1450, 2185, 176],
+    [2080, 2180, 172],
+    [2650, 2105, 166],
+
+    // --- Turn 1: decreasing-radius right-hander. Opens gently, then tightens
+    // --- and narrows all the way to the exit. Also the blind one: from the
+    // --- braking zone you cannot see where it lets you out.
+    [3080, 1960, 158],
+    [3360, 1715, 148],
+    [3480, 1430, 140],
+    [3470, 1150, 138],
+
+    // --- Fast flowing S-section across the top: wide, alternating direction
+    [3330, 890, 152],
+    [3060, 720, 162],
+    [2760, 700, 164],
+    [2470, 810, 162],
+    [2180, 800, 162],
+    [1900, 640, 158],
+    [1620, 570, 156],
+    [1330, 620, 150],
+
+    // --- Sweep left and down onto the back section, narrowing
+    [1030, 560, 146],
+    [760, 645, 140],
+    [620, 855, 136],
+    [640, 1090, 134],
+
+    // --- Technical infield entry: tight, narrow
+    [775, 1290, 130],
+    [1005, 1380, 126],
+    [1235, 1420, 124],
+
+    // --- The hairpin: genuine 180, tightest and narrowest part of the lap
+    [1405, 1530, 120],
+    [1395, 1705, 120],
+    [1210, 1785, 122],
+
+    // --- Return leg, opening back up
+    [980, 1795, 132],
+    [765, 1835, 138],
+
+    // --- Final corner: a constant-radius 180 back onto the start/finish
+    // --- straight. Radius ~158 against a 138-wide track leaves the inner
+    // --- barrier a healthy margin — tighten this and it pinches shut.
+    [640, 1837, 140],
+    [520, 1885, 138],
+    [482, 1995, 138],
+    [520, 2108, 142],
+    [645, 2152, 152],
   ],
 };
 
@@ -36,16 +83,19 @@ const TRACK_DATA = {
 function buildTrack(data) {
   const cps = data.controlPoints;
   const n = cps.length;
-  const halfW = data.width / 2;
+  const widthOf = (p) => (p.length > 2 ? p[2] : data.defaultWidth);
 
-  // --- Catmull-Rom sample of the closed control polygon into a dense centreline ---
+  // --- Catmull-Rom sample of the closed control polygon into a dense
+  // --- centreline. Width is interpolated linearly over the same parameter.
   const centerline = [];
+  const rawWidth = [];
   const SAMPLE_SPACING = 12; // approx px between dense points
   for (let i = 0; i < n; i++) {
     const p0 = cps[(i - 1 + n) % n];
     const p1 = cps[i];
     const p2 = cps[(i + 1) % n];
     const p3 = cps[(i + 2) % n];
+    const w1 = widthOf(p1), w2 = widthOf(p2);
     const segLen = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
     const steps = Math.max(4, Math.round(segLen / SAMPLE_SPACING));
     for (let s = 0; s < steps; s++) {
@@ -59,10 +109,21 @@ function buildTrack(data) {
           (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
           (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
       });
+      rawWidth.push(w1 + (w2 - w1) * t);
     }
   }
 
   const count = centerline.length;
+
+  // Smooth the width so it eases between sections instead of kinking at
+  // control points.
+  const halfWidths = [];
+  const W_SMOOTH = 7;
+  for (let i = 0; i < count; i++) {
+    let sum = 0;
+    for (let k = -W_SMOOTH; k <= W_SMOOTH; k++) sum += rawWidth[(i + k + count) % count];
+    halfWidths.push(sum / (W_SMOOTH * 2 + 1) / 2);
+  }
 
   // --- tangents, normals, cumulative arc length ---
   // Normals point to the DRIVER'S RIGHT (y grows downward, so rotating the
@@ -85,8 +146,7 @@ function buildTrack(data) {
 
   // --- signed curvature (1/radius) at each point ---
   // Positive = turning right (toward +normal), negative = turning left.
-  // Used to decide which side of a corner is the inside (for kerbs) and,
-  // later, how hard a car should brake for what's coming up.
+  // Drives kerb placement here and corner speeds in ai.js.
   const CURV_WINDOW = 4;
   const rawCurv = [];
   for (let i = 0; i < count; i++) {
@@ -113,13 +173,14 @@ function buildTrack(data) {
   // wallRight sits on the driver's right, wallLeft on the driver's left.
   const wallRight = [], wallLeft = [];
   for (let i = 0; i < count; i++) {
+    const hw = halfWidths[i];
     wallRight.push({
-      x: centerline[i].x + normals[i].x * halfW,
-      y: centerline[i].y + normals[i].y * halfW,
+      x: centerline[i].x + normals[i].x * hw,
+      y: centerline[i].y + normals[i].y * hw,
     });
     wallLeft.push({
-      x: centerline[i].x - normals[i].x * halfW,
-      y: centerline[i].y - normals[i].y * halfW,
+      x: centerline[i].x - normals[i].x * hw,
+      y: centerline[i].y - normals[i].y * hw,
     });
   }
 
@@ -170,7 +231,7 @@ function buildTrack(data) {
     return out;
   }
 
-  // --- checkpoint gates, evenly spaced by arc length. Gate 0 = start/finish. ---
+  // --- arc-length lookup helpers ---
   function indexAtArc(targetArc) {
     targetArc = ((targetArc % totalLength) + totalLength) % totalLength;
     let lo = 0, hi = count - 1;
@@ -180,6 +241,19 @@ function buildTrack(data) {
     }
     return lo;
   }
+
+  // Position + heading at a distance along the lap, optionally offset
+  // sideways (positive = driver's right). Used for the starting grid.
+  function poseAtArc(targetArc, lateral = 0) {
+    const i = indexAtArc(targetArc);
+    return {
+      x: centerline[i].x + normals[i].x * lateral,
+      y: centerline[i].y + normals[i].y * lateral,
+      angle: Math.atan2(tangents[i].y, tangents[i].x),
+    };
+  }
+
+  // --- checkpoint gates, evenly spaced by arc length. Gate 0 = start/finish. ---
   const gates = [];
   for (let g = 0; g < data.checkpointCount; g++) {
     const i = indexAtArc((g * totalLength) / data.checkpointCount);
@@ -191,14 +265,9 @@ function buildTrack(data) {
     });
   }
 
-  // --- start pose: just past the start/finish line, facing along the track ---
-  const si = indexAtArc(40);
-  const startPose = {
-    x: centerline[si].x, y: centerline[si].y,
-    angle: Math.atan2(tangents[si].y, tangents[si].x),
-  };
+  const startPose = poseAtArc(40);
 
-  // --- world bounding box (drives the fixed camera's fit-to-screen zoom) ---
+  // --- world bounding box (drives the camera's zoom and pan clamping) ---
   const BARRIER_PAD = 10; // barrier stroke half-width plus a little slack
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const p of [...wallRight, ...wallLeft]) {
@@ -215,10 +284,10 @@ function buildTrack(data) {
   bounds.height = bounds.maxY - bounds.minY;
 
   return {
-    centerline, tangents, normals, curvature, arc, totalLength,
+    centerline, tangents, normals, curvature, halfWidths, arc, totalLength,
     wallRight, wallLeft, wallSegments, queryWalls,
-    gates, startPose, bounds, halfW,
-    indexAtArc,
+    gates, startPose, bounds,
+    indexAtArc, poseAtArc,
   };
 }
 
@@ -243,6 +312,7 @@ class LapTracker {
     this.lapTimes = [];
     this.finished = false;
     this.finishTime = null;
+    this._nearestIndex = 0;     // cached for progress()
   }
 
   // Call once per physics substep with the car's pre/post-step positions.
@@ -278,15 +348,25 @@ class LapTracker {
     }
   }
 
-  // Monotonic race progress (used later for live position ranking).
+  // Monotonic race progress, used to rank cars. Walks the cached nearest
+  // centreline index forward rather than rescanning the whole track.
   progress(carX, carY) {
     const t = this.track;
-    let bestI = 0, bestD = Infinity;
-    for (let i = 0; i < t.centerline.length; i += 4) {
-      const dx = t.centerline[i].x - carX, dy = t.centerline[i].y - carY;
-      const d = dx * dx + dy * dy;
-      if (d < bestD) { bestD = d; bestI = i; }
+    const cl = t.centerline;
+    const n = cl.length;
+    const distTo = (i) => {
+      const dx = cl[i].x - carX, dy = cl[i].y - carY;
+      return dx * dx + dy * dy;
+    };
+    let i = this._nearestIndex;
+    let best = distTo(i);
+    // Local search in both directions (handles being nudged backwards).
+    for (let step = 1; step <= 40; step++) {
+      const f = (i + step) % n, b = (i - step + n) % n;
+      const df = distTo(f), db = distTo(b);
+      if (df < best) { best = df; this._nearestIndex = f; }
+      if (db < best) { best = db; this._nearestIndex = b; }
     }
-    return (this.lap - 1) * t.totalLength + t.arc[bestI];
+    return (this.lap - 1) * t.totalLength + t.arc[this._nearestIndex];
   }
 }
