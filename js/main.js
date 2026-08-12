@@ -1,27 +1,54 @@
 // ============================================================================
-// MAIN.JS — Game loop with fixed-timestep physics (delta-time based, so
-// behavior is identical on any refresh rate) and per-frame rendering.
+// MAIN.JS — Game loop glue: fixed-timestep physics (delta-time based, so
+// behavior is identical on any refresh rate), lap tracking, camera, HUD.
+// Track logic lives in track.js, physics in physics.js, drawing in render.js.
 // ============================================================================
 
 const canvas = document.getElementById('gameCanvas');
 Render.init(canvas);
+Render.initTrack(TRACK);
 Input.init();
 
-const PLAYER_START = { x: 500, y: 350, angle: -Math.PI / 2 };
-
-let player = new Car(PLAYER_START.x, PLAYER_START.y, PLAYER_START.angle);
+let player, playerLaps, raceTime;
 
 function restart() {
-  player = new Car(PLAYER_START.x, PLAYER_START.y, PLAYER_START.angle);
+  const sp = TRACK.startPose;
+  player = new Car(sp.x, sp.y, sp.angle);
+  playerLaps = new LapTracker(TRACK, TRACK_DATA.laps);
+  raceTime = 0;
+  Render.snapCameraTo(sp.x, sp.y);
+}
+restart();
+
+// ---- HUD -------------------------------------------------------------------
+
+function formatTime(t) {
+  if (t === null || t === undefined) return '--:--.---';
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  return `${m}:${s.toFixed(3).padStart(6, '0')}`;
 }
 
-// Keep the car on screen for step 1 (no track yet) by wrapping edges.
-function wrapToCanvas(car) {
-  if (car.x < -20) car.x = canvas.width + 20;
-  if (car.x > canvas.width + 20) car.x = -20;
-  if (car.y < -20) car.y = canvas.height + 20;
-  if (car.y > canvas.height + 20) car.y = -20;
+const raceInfoEl = document.getElementById('raceInfo');
+const debugInfoEl = document.getElementById('debugInfo');
+
+function updateHUD() {
+  if (playerLaps.finished) {
+    raceInfoEl.textContent =
+      `FINISHED!  Total ${formatTime(playerLaps.finishTime)}\n` +
+      `Best lap ${formatTime(playerLaps.bestLapTime)}   (R to restart)`;
+  } else {
+    raceInfoEl.textContent =
+      `LAP ${playerLaps.lap}/${playerLaps.totalLaps}\n` +
+      `Time ${formatTime(raceTime - playerLaps.lapStartTime)}\n` +
+      `Last ${formatTime(playerLaps.lastLapTime)}\n` +
+      `Best ${formatTime(playerLaps.bestLapTime)}`;
+  }
+  debugInfoEl.textContent =
+    `${Math.round(player.speed)} px/s · WASD/arrows drive · Space handbrake · R restart`;
 }
+
+// ---- game loop -------------------------------------------------------------
 
 const FIXED_DT = 1 / 120; // physics substep (s); rendering stays per-frame
 const MAX_FRAME_TIME = 0.25;
@@ -35,24 +62,25 @@ function frame(now) {
 
   if (Input.consumeRestart()) restart();
 
-  accumulator += frameTime;
   const input = Input.getCarInput();
+  accumulator += frameTime;
   while (accumulator >= FIXED_DT) {
+    const oldX = player.x, oldY = player.y;
     player.update(FIXED_DT, input);
-    wrapToCanvas(player);
+    collideCarWithTrack(player, oldX, oldY, TRACK);
+    if (!playerLaps.finished) raceTime += FIXED_DT;
+    playerLaps.update(oldX, oldY, player.x, player.y, raceTime);
     accumulator -= FIXED_DT;
   }
 
-  Render.clear();
-  Render.drawGrid();
+  Render.updateCamera(player, frameTime);
+  Render.beginWorld();
+  Render.drawTrack();
   Render.drawDriftMarks(player);
   Render.drawCar(player);
+  Render.endWorld();
 
-  document.getElementById('debugInfo').textContent =
-    `Speed: ${Math.round(player.speed)} px/s\n` +
-    `Drift: ${Math.round(Math.abs(player.lateralSpeed))} px/s\n` +
-    `WASD/Arrows drive · Space handbrake · R restart`;
-
+  updateHUD();
   requestAnimationFrame(frame);
 }
 

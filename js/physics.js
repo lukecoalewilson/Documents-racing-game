@@ -53,13 +53,119 @@ const PHYSICS = {
   HANDBRAKE_GRIP: 1.2,        // grip used while handbraking — much lower, so the car slides sideways
   HANDBRAKE_DRAG_BOOST: 1.6,  // extra forward-drag multiplier while handbraking (scrubs speed in a slide)
 
-  // --- Collision (used once walls exist) ---
+  // --- Collision ---
+  CAR_RADIUS: 13,             // collision radius (px) of the car vs walls/cars
   WALL_BOUNCE: 0.35,          // fraction of into-wall velocity reflected back out
-  WALL_SPEED_SCRUB: 0.55,     // fraction of speed lost on wall impact
+  WALL_SPEED_SCRUB: 0.55,     // max fraction of speed lost on a fully head-on wall hit
+                              // (a shallow scrape scrubs proportionally less)
 };
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+// --- geometry helpers -------------------------------------------------------
+
+// Intersection of segments (p1→p2) and (p3→p4). Returns t along the FIRST
+// segment in [0,1], or null if they don't cross.
+function segSegIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+  const d1x = x2 - x1, d1y = y2 - y1;
+  const d2x = x4 - x3, d2y = y4 - y3;
+  const denom = d1x * d2y - d1y * d2x;
+  if (Math.abs(denom) < 1e-12) return null;
+  const t = ((x3 - x1) * d2y - (y3 - y1) * d2x) / denom;
+  const u = ((x3 - x1) * d1y - (y3 - y1) * d1x) / denom;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  return t;
+}
+
+// Closest point on segment (ax,ay)→(bx,by) to point (px,py).
+function segClosestPoint(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+  t = clamp(t, 0, 1);
+  return { x: ax + dx * t, y: ay + dy * t };
+}
+
+// --- wall collision ---------------------------------------------------------
+
+// Slide-along-wall response: kill the velocity component going INTO the wall
+// (with a small bounce so the car never dead-stops glued to it), keep the
+// component running along the wall, and scrub speed in proportion to how
+// head-on the impact was. n = unit normal pointing away from the wall.
+function applyWallResponse(car, nx, ny) {
+  const vn = car.vx * nx + car.vy * ny;
+  if (vn >= 0) return; // already separating
+  const speed = Math.hypot(car.vx, car.vy);
+  car.vx -= (1 + PHYSICS.WALL_BOUNCE) * vn * nx;
+  car.vy -= (1 + PHYSICS.WALL_BOUNCE) * vn * ny;
+  const headOn = Math.min(1, -vn / Math.max(speed, 1e-6));
+  const scale = 1 - PHYSICS.WALL_SPEED_SCRUB * headOn;
+  car.vx *= scale;
+  car.vy *= scale;
+}
+
+// Collide a car against the track barriers. Called after each physics
+// substep with the pre-step position, so the SWEPT PATH between frames is
+// checked — a fast car can't tunnel through a wall between two positions.
+function collideCarWithTrack(car, oldX, oldY, track) {
+  const r = PHYSICS.CAR_RADIUS;
+  const pad = r + 6;
+  const segs = track.queryWalls(
+    Math.min(oldX, car.x) - pad, Math.min(oldY, car.y) - pad,
+    Math.max(oldX, car.x) + pad, Math.max(oldY, car.y) + pad
+  );
+  if (segs.length === 0) return;
+
+  // Pass 1 (swept): did the car's centre CROSS a wall segment this step?
+  // If so, pull it back to the earliest crossing point and respond there.
+  let bestT = Infinity, hitSeg = null;
+  for (const s of segs) {
+    const t = segSegIntersect(oldX, oldY, car.x, car.y, s.ax, s.ay, s.bx, s.by);
+    if (t !== null && t < bestT) { bestT = t; hitSeg = s; }
+  }
+  if (hitSeg) {
+    car.x = oldX + (car.x - oldX) * bestT;
+    car.y = oldY + (car.y - oldY) * bestT;
+    // Wall normal oriented toward the side the car came from.
+    let nx = -(hitSeg.by - hitSeg.ay), ny = hitSeg.bx - hitSeg.ax;
+    const nl = Math.hypot(nx, ny) || 1;
+    nx /= nl; ny /= nl;
+    if ((oldX - hitSeg.ax) * nx + (oldY - hitSeg.ay) * ny < 0) { nx = -nx; ny = -ny; }
+    applyWallResponse(car, nx, ny);
+    car.x += nx * r; // pop the centre a radius off the wall
+    car.y += ny * r;
+  }
+
+  // Pass 2 (discrete): resolve any remaining overlap between the car's
+  // collision circle and nearby wall segments (handles scrapes and corners).
+  for (let iter = 0; iter < 3; iter++) {
+    let pushed = false;
+    for (const s of segs) {
+      const cp = segClosestPoint(car.x, car.y, s.ax, s.ay, s.bx, s.by);
+      const dx = car.x - cp.x, dy = car.y - cp.y;
+      const d = Math.hypot(dx, dy);
+      if (d >= r) continue;
+      let nx, ny;
+      if (d > 1e-6) {
+        nx = dx / d; ny = dy / d;
+      } else {
+        // Centre exactly on the wall: use the segment normal facing the old position.
+        nx = -(s.by - s.ay); ny = s.bx - s.ax;
+        const nl = Math.hypot(nx, ny) || 1;
+        nx /= nl; ny /= nl;
+        if ((oldX - s.ax) * nx + (oldY - s.ay) * ny < 0) { nx = -nx; ny = -ny; }
+      }
+      car.x = cp.x + nx * r;
+      car.y = cp.y + ny * r;
+      applyWallResponse(car, nx, ny);
+      pushed = true;
+    }
+    if (!pushed) break;
+  }
+
+  car.speed = Math.hypot(car.vx, car.vy);
 }
 
 class Car {
