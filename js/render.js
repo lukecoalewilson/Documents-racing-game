@@ -1,189 +1,283 @@
 // ============================================================================
-// RENDER.JS — All canvas drawing: pre-rendered track background, camera that
-// follows the car, and cars drawn with primitives (no images anywhere).
+// RENDER.JS — All canvas drawing. Everything is primitives; no images.
+//
+// CAMERA: fixed. The whole circuit is scaled and centred to fit the canvas,
+// with the zoom derived from the track's bounding box, so editing the layout
+// in track.js automatically refits. Nothing scrolls.
+//
+// The static parts of the world (ground, tarmac, kerbs, barriers, start line)
+// are pre-rendered once into an offscreen layer at display resolution, so a
+// frame costs one blit plus the cars.
 // ============================================================================
+
+// --- Colour palette. Calm and low-contrast by design: the cars are meant to
+// --- be the brightest, most saturated things on screen.
+const PALETTE = {
+  ground:        '#232a29',              // surrounding grass / infield
+  groundSpeckle: 'rgba(255,255,255,0.014)',
+  surface:       '#414a52',              // tarmac — slightly darker than the barriers
+  surfaceSeam:   'rgba(206,220,230,0.07)', // faint centreline dashes
+  edgeLine:      'rgba(198,214,226,0.26)', // thin lighter line marking the track edge
+  barrier:       '#6d7f90',              // muted grey-blue barrier
+  barrierEdge:   'rgba(28,34,40,0.35)',  // slight darkening under the barrier for depth
+  kerbRed:       '#8a5c58',              // desaturated red, low contrast against...
+  kerbPale:      '#8d979e',              // ...this muted grey
+  startPale:     '#9aa6ae',              // kept dimmer than the cars on purpose
+  startDark:     '#3b444b',
+};
+
+// Kerbs only appear where the track is genuinely cornering: anywhere the
+// radius is tighter than this, on the inside of the bend.
+const KERB_MIN_RADIUS = 400;   // px — larger value = kerbs on more of the lap
+const KERB_WIDTH = 17;         // px, world space
+const KERB_STRIPE_POINTS = 6;  // centreline samples per stripe (wider = calmer)
+const EDGE_LINE_INSET = 15;    // px inboard of the barrier
+
+// Car dimensions in world px. Sized so the car stays readable at the
+// fit-to-screen zoom while still leaving room for four abreast on a
+// 150px-wide track.
+const CAR_LENGTH = 56;
+const CAR_WIDTH = 28;
 
 const Render = {
   ctx: null,
   canvas: null,
-  trackCanvas: null,   // offscreen canvas holding the full pre-rendered world
-  camera: { x: 0, y: 0, worldW: 0, worldH: 0 },
+  trackLayer: null,                        // offscreen canvas, display resolution
+  view: { scale: 1, offsetX: 0, offsetY: 0 },
+  margin: 18,                              // CSS px of breathing room around the track
 
   init(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
   },
 
-  // ---- camera --------------------------------------------------------------
+  // ---- fixed camera --------------------------------------------------------
 
-  snapCameraTo(x, y) {
-    this.camera.x = x;
-    this.camera.y = y;
-    this.clampCamera();
+  // Size the canvas to its container and refit the track. Call on load and
+  // whenever the window resizes.
+  resize(track) {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = this.canvas.clientWidth || window.innerWidth;
+    const cssH = this.canvas.clientHeight || window.innerHeight;
+    this.canvas.width = Math.max(1, Math.round(cssW * dpr));
+    this.canvas.height = Math.max(1, Math.round(cssH * dpr));
+    this.computeView(track, dpr);
+    this.renderTrackLayer(track);
   },
 
-  updateCamera(car, dt) {
-    const cam = this.camera;
-    // Look slightly ahead of the car along its velocity so there's room to see.
-    const targetX = car.x + car.vx * 0.35;
-    const targetY = car.y + car.vy * 0.35;
-    const k = 1 - Math.exp(-4 * dt); // framerate-independent smoothing
-    cam.x += (targetX - cam.x) * k;
-    cam.y += (targetY - cam.y) * k;
-    this.clampCamera();
+  // Derive zoom and centring from the track's bounding box so any layout fits.
+  computeView(track, dpr) {
+    const b = track.bounds;
+    const m = this.margin * dpr;
+    const availW = this.canvas.width - m * 2;
+    const availH = this.canvas.height - m * 2;
+    const scale = Math.min(availW / b.width, availH / b.height);
+    this.view.scale = scale;
+    this.view.offsetX = (this.canvas.width - b.width * scale) / 2 - b.minX * scale;
+    this.view.offsetY = (this.canvas.height - b.height * scale) / 2 - b.minY * scale;
   },
 
-  clampCamera() {
-    const cam = this.camera;
-    const hw = this.canvas.width / 2, hh = this.canvas.height / 2;
-    cam.x = clamp(cam.x, hw, Math.max(hw, cam.worldW - hw));
-    cam.y = clamp(cam.y, hh, Math.max(hh, cam.worldH - hh));
+  // Apply the world→screen transform to a context.
+  applyWorldTransform(ctx) {
+    const v = this.view;
+    ctx.setTransform(v.scale, 0, 0, v.scale, v.offsetX, v.offsetY);
   },
 
   beginWorld() {
-    const cam = this.camera;
     this.ctx.save();
-    this.ctx.translate(
-      Math.round(this.canvas.width / 2 - cam.x),
-      Math.round(this.canvas.height / 2 - cam.y)
-    );
+    this.applyWorldTransform(this.ctx);
   },
 
   endWorld() {
     this.ctx.restore();
   },
 
-  // ---- track pre-render ----------------------------------------------------
+  // ---- static world pre-render --------------------------------------------
 
-  initTrack(track) {
-    this.camera.worldW = track.worldW;
-    this.camera.worldH = track.worldH;
+  renderTrackLayer(track) {
+    const w = this.canvas.width, h = this.canvas.height;
+    const layer = document.createElement('canvas');
+    layer.width = w;
+    layer.height = h;
+    const ctx = layer.getContext('2d');
 
-    const tc = document.createElement('canvas');
-    tc.width = track.worldW;
-    tc.height = track.worldH;
-    const ctx = tc.getContext('2d');
-
-    // grass
-    ctx.fillStyle = '#2d5a27';
-    ctx.fillRect(0, 0, tc.width, tc.height);
-    ctx.fillStyle = 'rgba(0,0,0,0.08)';
-    for (let i = 0; i < 2500; i++) {
-      ctx.fillRect(Math.random() * tc.width, Math.random() * tc.height, 3, 3);
+    // Ground, in screen space so it always covers the canvas.
+    ctx.fillStyle = PALETTE.ground;
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = PALETTE.groundSpeckle;
+    for (let i = 0; i < 1600; i++) {
+      ctx.fillRect(Math.random() * w, Math.random() * h, 2, 2);
     }
 
-    // track surface (ring between the two barrier loops)
+    ctx.save();
+    this.applyWorldTransform(ctx);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'butt';
+
     const tracePath = (pts) => {
       ctx.moveTo(pts[0].x, pts[0].y);
       for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
       ctx.closePath();
     };
+
+    // Tarmac: the ring between the two barrier loops.
     ctx.beginPath();
-    tracePath(track.leftWall);
-    tracePath(track.rightWall);
-    ctx.fillStyle = '#43454b';
+    tracePath(track.wallRight);
+    tracePath(track.wallLeft);
+    ctx.fillStyle = PALETTE.surface;
     ctx.fill('evenodd');
 
-    // subtle centreline dashes
+    // Faint centreline seam.
     ctx.beginPath();
     tracePath(track.centerline);
-    ctx.strokeStyle = 'rgba(255,255,255,0.13)';
+    ctx.strokeStyle = PALETTE.surfaceSeam;
     ctx.lineWidth = 3;
-    ctx.setLineDash([18, 30]);
+    ctx.setLineDash([20, 34]);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // white edge lines just inside the barriers
-    const edge = (pts, normSign) => {
+    this.drawKerbs(ctx, track);
+    this.drawEdgeLines(ctx, track);
+    this.drawBarriers(ctx, track);
+    this.drawStartLine(ctx, track);
+
+    ctx.restore();
+    this.trackLayer = layer;
+  },
+
+  // Kerbs run along the INSIDE of corners only — the side the track curves
+  // toward. track.curvature is signed: positive turns toward the normal
+  // (driver's right), negative toward the left.
+  drawKerbs(ctx, track) {
+    const cl = track.centerline, nrm = track.normals, curv = track.curvature;
+    const count = cl.length;
+    const threshold = 1 / KERB_MIN_RADIUS;
+    const offset = track.halfW - KERB_WIDTH / 2;
+
+    ctx.lineWidth = KERB_WIDTH;
+    ctx.lineCap = 'butt';
+
+    for (let i = 0; i < count; i++) {
+      const k = curv[i];
+      if (Math.abs(k) < threshold) continue;
+      const side = k > 0 ? 1 : -1; // +1 = driver's right, -1 = driver's left
+      const j = (i + 1) % count;
+      // Both endpoints use side from point i, so a left/right transition just
+      // ends one kerb and starts the other — it never draws across the track.
+      const ax = cl[i].x + nrm[i].x * offset * side;
+      const ay = cl[i].y + nrm[i].y * offset * side;
+      const bx = cl[j].x + nrm[j].x * offset * side;
+      const by = cl[j].y + nrm[j].y * offset * side;
+
+      ctx.strokeStyle = Math.floor(i / KERB_STRIPE_POINTS) % 2 === 0
+        ? PALETTE.kerbRed : PALETTE.kerbPale;
       ctx.beginPath();
-      for (let i = 0; i < pts.length; i++) {
-        const p = track.centerline[i], nrm = track.normals[i];
-        const off = (track.halfW - 7) * normSign;
-        const x = p.x + nrm.x * off, y = p.y + nrm.y * off;
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+    }
+  },
+
+  // Thin lighter line just inboard of each barrier.
+  drawEdgeLines(ctx, track) {
+    const cl = track.centerline, nrm = track.normals;
+    const offset = track.halfW - EDGE_LINE_INSET;
+    ctx.strokeStyle = PALETTE.edgeLine;
+    ctx.lineWidth = 2.5;
+    for (const side of [1, -1]) {
+      ctx.beginPath();
+      for (let i = 0; i < cl.length; i++) {
+        const x = cl[i].x + nrm[i].x * offset * side;
+        const y = cl[i].y + nrm[i].y * offset * side;
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       ctx.closePath();
-      ctx.strokeStyle = 'rgba(255,255,255,0.6)';
-      ctx.lineWidth = 2.5;
       ctx.stroke();
-    };
-    edge(track.leftWall, 1);
-    edge(track.rightWall, -1);
+    }
+  },
 
-    // barriers: alternating red/white striped blocks
-    const stripes = (pts) => {
-      ctx.lineWidth = 10;
-      ctx.lineCap = 'butt';
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i], b = pts[(i + 1) % pts.length];
-        ctx.strokeStyle = i % 2 === 0 ? '#c8102e' : '#e8e8e8';
-        ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
-        ctx.stroke();
-      }
-    };
-    stripes(track.leftWall);
-    stripes(track.rightWall);
+  // Solid muted grey-blue barriers, with a soft dark line under them so the
+  // wall reads as raised without adding contrast.
+  drawBarriers(ctx, track) {
+    for (const pts of [track.wallRight, track.wallLeft]) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.closePath();
 
-    // start/finish checkered strip across the track at gate 0
+      ctx.strokeStyle = PALETTE.barrierEdge;
+      ctx.lineWidth = 13;
+      ctx.stroke();
+
+      ctx.strokeStyle = PALETTE.barrier;
+      ctx.lineWidth = 9;
+      ctx.stroke();
+    }
+  },
+
+  // Muted checkered strip across the track at gate 0.
+  drawStartLine(ctx, track) {
     const g = track.gates[0];
     const across = Math.hypot(g.bx - g.ax, g.by - g.ay);
+    const cols = 10;
+    const cell = across / cols;
     ctx.save();
     ctx.translate(g.cx, g.cy);
     ctx.rotate(Math.atan2(g.by - g.ay, g.bx - g.ax));
-    const cell = across / 14;
     for (let row = -1; row < 1; row++) {
-      for (let col = 0; col < 14; col++) {
-        ctx.fillStyle = (row + col) % 2 === 0 ? '#f2f2f2' : '#111';
-        ctx.fillRect(-across / 2 + col * cell, row * cell, cell, cell);
+      for (let col = 0; col < cols; col++) {
+        ctx.fillStyle = (row + col) % 2 === 0 ? PALETTE.startPale : PALETTE.startDark;
+        ctx.fillRect(-across / 2 + col * cell, row * cell, cell + 0.5, cell + 0.5);
       }
     }
     ctx.restore();
-
-    this.trackCanvas = tc;
   },
 
   drawTrack() {
-    this.ctx.drawImage(this.trackCanvas, 0, 0);
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.drawImage(this.trackLayer, 0, 0);
   },
 
-  // ---- dynamic objects (call between beginWorld/endWorld) -------------------
+  // ---- dynamic objects (call between beginWorld/endWorld) ------------------
 
-  drawCar(car, bodyColor = '#e33', accentColor = '#fff') {
+  drawCar(car, bodyColor = '#ff5a4d', accentColor = '#f4f8fa') {
     const ctx = this.ctx;
-    const w = 34; // car length (along heading)
-    const h = 18; // car width
+    const w = CAR_LENGTH;
+    const h = CAR_WIDTH;
 
     ctx.save();
     ctx.translate(car.x, car.y);
     ctx.rotate(car.angle);
 
-    // shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    ctx.fillRect(-w / 2 + 2, -h / 2 + 3, w, h);
+    // drop shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.32)';
+    ctx.beginPath();
+    ctx.roundRect(-w / 2 + 3, -h / 2 + 4, w, h, 7);
+    ctx.fill();
 
-    // tires (four corners, slightly inset)
-    ctx.fillStyle = '#111';
-    const tw = 8, th = 4;
-    ctx.fillRect(-w / 2 + 3, -h / 2 - 1, tw, th);
-    ctx.fillRect(-w / 2 + 3, h / 2 - th + 1, tw, th);
-    ctx.fillRect(w / 2 - tw - 3, -h / 2 - 1, tw, th);
-    ctx.fillRect(w / 2 - tw - 3, h / 2 - th + 1, tw, th);
+    // tires
+    ctx.fillStyle = '#15181b';
+    const tw = 13, th = 6;
+    ctx.fillRect(-w / 2 + 5, -h / 2 - 2, tw, th);
+    ctx.fillRect(-w / 2 + 5, h / 2 - th + 2, tw, th);
+    ctx.fillRect(w / 2 - tw - 5, -h / 2 - 2, tw, th);
+    ctx.fillRect(w / 2 - tw - 5, h / 2 - th + 2, tw, th);
 
     // body
     ctx.fillStyle = bodyColor;
     ctx.beginPath();
-    ctx.roundRect(-w / 2, -h / 2, w, h, 5);
+    ctx.roundRect(-w / 2, -h / 2, w, h, 7);
     ctx.fill();
 
-    // windshield / cockpit
+    // cockpit
     ctx.fillStyle = accentColor;
-    ctx.fillRect(w / 6 - 4, -h / 2 + 4, 8, h - 8);
+    ctx.beginPath();
+    ctx.roundRect(-2, -h / 2 + 6, 13, h - 12, 3);
+    ctx.fill();
 
-    // nose stripe so heading is obvious
-    ctx.fillStyle = 'rgba(255,255,255,0.55)';
-    ctx.fillRect(w / 2 - 6, -2, 5, 4);
+    // nose flash so heading is unmistakable at this zoom
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillRect(w / 2 - 8, -3.5, 6, 7);
 
     ctx.restore();
   },
@@ -195,9 +289,9 @@ const Render = {
     ctx.save();
     ctx.translate(car.x, car.y);
     ctx.rotate(car.angle);
-    ctx.fillStyle = 'rgba(0,0,0,0.35)';
-    ctx.fillRect(-14, -10, 5, 3);
-    ctx.fillRect(-14, 7, 5, 3);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(-CAR_LENGTH / 2 + 3, -CAR_WIDTH / 2 - 2, 9, 5);
+    ctx.fillRect(-CAR_LENGTH / 2 + 3, CAR_WIDTH / 2 - 3, 9, 5);
     ctx.restore();
   },
 };

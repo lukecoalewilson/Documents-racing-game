@@ -1,22 +1,23 @@
 // ============================================================================
 // MAIN.JS — Game loop glue: fixed-timestep physics (delta-time based, so
-// behavior is identical on any refresh rate), lap tracking, camera, HUD.
+// behavior is identical on any refresh rate), lap tracking, HUD.
 // Track logic lives in track.js, physics in physics.js, drawing in render.js.
 // ============================================================================
 
 const canvas = document.getElementById('gameCanvas');
 Render.init(canvas);
-Render.initTrack(TRACK);
+Render.resize(TRACK);
 Input.init();
+
+window.addEventListener('resize', () => Render.resize(TRACK));
 
 let player, playerLaps, raceTime;
 
 function restart() {
   const sp = TRACK.startPose;
   player = new Car(sp.x, sp.y, sp.angle);
-  playerLaps = new LapTracker(TRACK, TRACK_DATA.laps);
+  playerLaps = new LapTracker(TRACK, RACE_LAPS);
   raceTime = 0;
-  Render.snapCameraTo(sp.x, sp.y);
 }
 restart();
 
@@ -73,9 +74,8 @@ function frame(now) {
     accumulator -= FIXED_DT;
   }
 
-  Render.updateCamera(player, frameTime);
-  Render.beginWorld();
   Render.drawTrack();
+  Render.beginWorld();
   Render.drawDriftMarks(player);
   Render.drawCar(player);
   Render.endWorld();

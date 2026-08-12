@@ -1,8 +1,8 @@
 // ============================================================================
 // TRACK.JS — The circuit, defined as DATA: a list of centreline control
 // points plus a width. Everything else (smooth centreline, barriers, wall
-// collision segments, checkpoint gates, start pose) is derived from that,
-// so you reshape the track by editing TRACK_DATA only.
+// collision segments, curvature, checkpoint gates, bounding box, start pose)
+// is derived from that, so you reshape the track by editing TRACK_DATA only.
 //
 // Layout notes: control points are smoothed with a Catmull-Rom spline, so
 // the drawn centreline passes THROUGH every point. Points are world-space
@@ -10,10 +10,12 @@
 // width/2 or the inner barrier will pinch.
 // ============================================================================
 
+// Race length. This is the only place the lap count is defined.
+const RACE_LAPS = 5;
+
 const TRACK_DATA = {
   width: 150,           // track surface width (px). Barriers sit at ±width/2.
   checkpointCount: 12,  // invisible ordered gates (gate 0 = start/finish line)
-  laps: 3,
 
   // Centreline control points. Current layout: bottom start/finish straight
   // (heading +x) → fast right-hand sweeper → top straight with a kink →
@@ -63,6 +65,8 @@ function buildTrack(data) {
   const count = centerline.length;
 
   // --- tangents, normals, cumulative arc length ---
+  // Normals point to the DRIVER'S RIGHT (y grows downward, so rotating the
+  // tangent by +90° in screen space lands on the right-hand side of travel).
   const tangents = [], normals = [], arc = [];
   let totalLength = 0;
   for (let i = 0; i < count; i++) {
@@ -79,14 +83,41 @@ function buildTrack(data) {
     totalLength += Math.hypot(next.x - centerline[i].x, next.y - centerline[i].y);
   }
 
-  // --- barrier polylines offset from the centreline ---
-  const leftWall = [], rightWall = [];
+  // --- signed curvature (1/radius) at each point ---
+  // Positive = turning right (toward +normal), negative = turning left.
+  // Used to decide which side of a corner is the inside (for kerbs) and,
+  // later, how hard a car should brake for what's coming up.
+  const CURV_WINDOW = 4;
+  const rawCurv = [];
   for (let i = 0; i < count; i++) {
-    leftWall.push({
+    const a = centerline[(i - CURV_WINDOW + count) % count];
+    const b = centerline[i];
+    const c = centerline[(i + CURV_WINDOW) % count];
+    const cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    const ab = Math.hypot(b.x - a.x, b.y - a.y);
+    const bc = Math.hypot(c.x - b.x, c.y - b.y);
+    const ca = Math.hypot(a.x - c.x, a.y - c.y);
+    const denom = ab * bc * ca;
+    rawCurv.push(denom > 1e-9 ? (2 * cross) / denom : 0);
+  }
+  // Smooth it so corner entry/exit doesn't flicker between points.
+  const curvature = [];
+  const SMOOTH = 3;
+  for (let i = 0; i < count; i++) {
+    let sum = 0;
+    for (let k = -SMOOTH; k <= SMOOTH; k++) sum += rawCurv[(i + k + count) % count];
+    curvature.push(sum / (SMOOTH * 2 + 1));
+  }
+
+  // --- barrier polylines offset from the centreline ---
+  // wallRight sits on the driver's right, wallLeft on the driver's left.
+  const wallRight = [], wallLeft = [];
+  for (let i = 0; i < count; i++) {
+    wallRight.push({
       x: centerline[i].x + normals[i].x * halfW,
       y: centerline[i].y + normals[i].y * halfW,
     });
-    rightWall.push({
+    wallLeft.push({
       x: centerline[i].x - normals[i].x * halfW,
       y: centerline[i].y - normals[i].y * halfW,
     });
@@ -100,8 +131,8 @@ function buildTrack(data) {
       wallSegments.push({ ax: a.x, ay: a.y, bx: b.x, by: b.y });
     }
   };
-  addLoop(leftWall);
-  addLoop(rightWall);
+  addLoop(wallRight);
+  addLoop(wallLeft);
 
   // --- spatial hash grid over wall segments for fast collision queries ---
   const CELL = 160;
@@ -153,8 +184,8 @@ function buildTrack(data) {
   for (let g = 0; g < data.checkpointCount; g++) {
     const i = indexAtArc((g * totalLength) / data.checkpointCount);
     gates.push({
-      ax: leftWall[i].x, ay: leftWall[i].y,
-      bx: rightWall[i].x, by: rightWall[i].y,
+      ax: wallRight[i].x, ay: wallRight[i].y,
+      bx: wallLeft[i].x, by: wallLeft[i].y,
       dirX: tangents[i].x, dirY: tangents[i].y, // forward direction of travel
       cx: centerline[i].x, cy: centerline[i].y,
     });
@@ -167,19 +198,26 @@ function buildTrack(data) {
     angle: Math.atan2(tangents[si].y, tangents[si].x),
   };
 
-  // --- world bounds (for the camera and the pre-rendered background) ---
-  let maxX = 0, maxY = 0;
-  for (const p of [...leftWall, ...rightWall]) {
-    maxX = Math.max(maxX, p.x);
-    maxY = Math.max(maxY, p.y);
+  // --- world bounding box (drives the fixed camera's fit-to-screen zoom) ---
+  const BARRIER_PAD = 10; // barrier stroke half-width plus a little slack
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of [...wallRight, ...wallLeft]) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
   }
-  const worldW = Math.ceil(maxX + 60);
-  const worldH = Math.ceil(maxY + 60);
+  const bounds = {
+    minX: minX - BARRIER_PAD, minY: minY - BARRIER_PAD,
+    maxX: maxX + BARRIER_PAD, maxY: maxY + BARRIER_PAD,
+  };
+  bounds.width = bounds.maxX - bounds.minX;
+  bounds.height = bounds.maxY - bounds.minY;
 
   return {
-    centerline, tangents, normals, arc, totalLength,
-    leftWall, rightWall, wallSegments, queryWalls,
-    gates, startPose, worldW, worldH, halfW,
+    centerline, tangents, normals, curvature, arc, totalLength,
+    wallRight, wallLeft, wallSegments, queryWalls,
+    gates, startPose, bounds, halfW,
     indexAtArc,
   };
 }

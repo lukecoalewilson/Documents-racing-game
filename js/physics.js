@@ -54,7 +54,9 @@ const PHYSICS = {
   HANDBRAKE_DRAG_BOOST: 1.6,  // extra forward-drag multiplier while handbraking (scrubs speed in a slide)
 
   // --- Collision ---
-  CAR_RADIUS: 13,             // collision radius (px) of the car vs walls/cars
+  CAR_RADIUS: 16,             // collision radius (px) of the car vs walls/cars
+                              // (car body is 56x28 in render.js — this sits
+                              //  between half-width and half-length)
   WALL_BOUNCE: 0.35,          // fraction of into-wall velocity reflected back out
   WALL_SPEED_SCRUB: 0.55,     // max fraction of speed lost on a fully head-on wall hit
                               // (a shallow scrape scrubs proportionally less)
