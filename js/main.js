@@ -9,8 +9,15 @@ const canvas = document.getElementById('gameCanvas');
 Render.init(canvas);
 Render.resize(TRACK);
 Input.init();
+Smoke.init();
+// The skid layer matches the pre-rendered track layer's resolution so both
+// composite with the same camera maths.
+SkidMarks.init(TRACK, Render.layerScale);
 
-window.addEventListener('resize', () => Render.resize(TRACK));
+window.addEventListener('resize', () => {
+  Render.resize(TRACK);
+  SkidMarks.init(TRACK, Render.layerScale); // carries existing marks across
+});
 
 // Grid slots, measured along the lap from the start/finish line, two abreast.
 // The player starts at the back so there is traffic to work through.
@@ -91,6 +98,10 @@ function restart() {
   // Fresh random hold every start, so the getaway can't be memorised.
   lightsOutAt = START_LIGHTS.COUNT * START_LIGHTS.INTERVAL +
     START_LIGHTS.HOLD_MIN + Math.random() * (START_LIGHTS.HOLD_MAX - START_LIGHTS.HOLD_MIN);
+
+  // A fresh race starts on clean tarmac.
+  SkidMarks.clear();
+  Smoke.clear();
 
   Render.snapCameraTo(TRACK, car.x, car.y);
   updateStandings();
@@ -223,11 +234,13 @@ function step(dt, playerInput) {
       // Held at the line: no input reaches the car, and it cannot be shoved
       // off its grid slot by the pack streaming past.
       freezeCar(e.car);
+      e.lastInput = null;
       e._oldX = e.car.x;
       e._oldY = e.car.y;
       continue;
     }
     const input = e.isPlayer ? playerInput : e.driver.update(dt, raceTime);
+    e.lastInput = input;   // effects need to know who is on the handbrake
     const oldX = e.car.x, oldY = e.car.y;
     e.car.update(dt, input);
     collideCarWithTrack(e.car, oldX, oldY, TRACK);
@@ -263,17 +276,33 @@ function frame(now) {
   updateStandings();
   Render.updateCamera(TRACK, player.car, frameTime);
 
+  // Effects: skid marks are stamped into their world layer, smoke advances.
+  for (const e of entries) {
+    if (racePhase === PHASE_COUNTDOWN || isCarHeld(e)) {
+      SkidMarks.resetCar(e.car);
+      continue;
+    }
+    SkidMarks.emit(e.car);
+    Smoke.emit(e.car, !!(e.lastInput && e.lastInput.handbrake), frameTime);
+  }
+  SkidMarks.update(frameTime);
+  Smoke.update(frameTime);
+
   Render.drawTrack(TRACK);
+  // Rubber sits on the tarmac, under the cars.
+  Render.blitWorldLayer(SkidMarks.canvas, TRACK);
+
   Render.beginWorld();
-  for (const e of entries) Render.drawDriftMarks(e.car);
   for (const e of entries) {
     if (!e.isPlayer) Render.drawCar(e.car, e.color, '#1d2226');
   }
   Render.drawCar(player.car, player.color, '#f4f8fa', true);
+  Smoke.draw(Render.ctx);   // above the cars
   Render.endWorld();
 
   const lights = startLightState();
   if (lights.visible) Render.drawStartLights(lights);
+  Render.drawSpeedometer(player.car.speed, frameTime);
 
   updateHUD();
   requestAnimationFrame(frame);

@@ -99,6 +99,35 @@ const EDGE_LINE_INSET = 13;     // px inboard of the barrier
 const CAR_LENGTH = 56;
 const CAR_WIDTH = 28;
 
+// --- Speedometer -------------------------------------------------------------
+const SPEEDO = {
+  // The physics works in px/s. This converts it to something that reads like
+  // a real car: MAX_SPEED (480 px/s) lands at ~230 km/h.
+  KMH_PER_PX_PER_S: 0.48,
+  DIAL_MAX_KMH: 260,
+  REDLINE_KMH: 210,
+  // Needle easing. Higher = snappier; this smooths out the jolts from kerbs
+  // and contact so the needle sweeps instead of twitching.
+  NEEDLE_SMOOTHING: 10,
+  RADIUS_FRACTION: 0.105,  // of the smaller canvas dimension
+  MARGIN_FRACTION: 0.030,
+  START_ANGLE: Math.PI * 0.75,  // dial sweeps 270 degrees, from lower-left
+  SWEEP: Math.PI * 1.5,
+};
+
+const SPEEDO_COLORS = {
+  face:      'rgba(16,20,23,0.82)',
+  rim:       'rgba(150,170,185,0.30)',
+  tick:      'rgba(206,220,230,0.55)',
+  tickMinor: 'rgba(206,220,230,0.25)',
+  label:     'rgba(214,226,234,0.75)',
+  redline:   '#c4342f',
+  arc:       'rgba(150,170,185,0.35)',
+  needle:    '#ff5a4d',
+  readout:   '#eef4f7',
+  unit:      'rgba(206,220,230,0.55)',
+};
+
 // Cap on the pre-rendered layer's resolution, to bound memory on big displays.
 const MAX_LAYER_DIMENSION = 4096;
 
@@ -369,19 +398,27 @@ const Render = {
     ctx.restore();
   },
 
-  // Blit the pre-rendered world at the current camera position.
-  drawTrack(track) {
-    const ctx = this.ctx;
+  // Blit a world-space layer (the track, the skid marks) at the current camera
+  // position. The layer covers the track's bounding box, so it lines up with
+  // the world no matter where the camera has panned to.
+  blitWorldLayer(layer, track) {
+    if (!layer) return;
     const b = track.bounds;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = PALETTE.ground;
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-    ctx.drawImage(
-      this.trackLayer,
-      0, 0, this.trackLayer.width, this.trackLayer.height,
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.drawImage(
+      layer,
+      0, 0, layer.width, layer.height,
       this.worldToScreenX(b.minX), this.worldToScreenY(b.minY),
       b.width * this.view.scale, b.height * this.view.scale
     );
+  },
+
+  drawTrack(track) {
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = PALETTE.ground;
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    this.blitWorldLayer(this.trackLayer, track);
   },
 
   // ---- dynamic objects (call between beginWorld/endWorld) ------------------
@@ -487,16 +524,91 @@ const Render = {
     ctx.restore();
   },
 
-  // Faint tire marks while drifting.
-  drawDriftMarks(car) {
-    if (Math.abs(car.lateralSpeed) < 60) return;
+  // ---- speedometer (screen space — never pans with the track) --------------
+
+  needleKmh: 0,   // smoothed, so the needle sweeps rather than twitching
+
+  drawSpeedometer(speedPxPerSec, dt) {
     const ctx = this.ctx;
+    const targetKmh = speedPxPerSec * SPEEDO.KMH_PER_PX_PER_S;
+    const k = 1 - Math.exp(-SPEEDO.NEEDLE_SMOOTHING * dt); // framerate-independent
+    this.needleKmh += (targetKmh - this.needleKmh) * k;
+
+    const W = this.canvas.width, H = this.canvas.height;
+    const R = Math.min(W, H) * SPEEDO.RADIUS_FRACTION;
+    const margin = Math.min(W, H) * SPEEDO.MARGIN_FRACTION;
+    const cx = W - margin - R;
+    const cy = H - margin - R;
+    const angleFor = (kmh) =>
+      SPEEDO.START_ANGLE + SPEEDO.SWEEP * clamp(kmh / SPEEDO.DIAL_MAX_KMH, 0, 1);
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.save();
-    ctx.translate(car.x, car.y);
-    ctx.rotate(car.angle);
-    ctx.fillStyle = 'rgba(0,0,0,0.3)';
-    ctx.fillRect(-CAR_LENGTH / 2 + 3, -CAR_WIDTH / 2 - 2, 9, 5);
-    ctx.fillRect(-CAR_LENGTH / 2 + 3, CAR_WIDTH / 2 - 3, 9, 5);
+
+    // face
+    ctx.fillStyle = SPEEDO_COLORS.face;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = SPEEDO_COLORS.rim;
+    ctx.lineWidth = Math.max(1, R * 0.02);
+    ctx.stroke();
+
+    // sweep arc, then the redline over its top end
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = R * 0.07;
+    ctx.strokeStyle = SPEEDO_COLORS.arc;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.84, SPEEDO.START_ANGLE, SPEEDO.START_ANGLE + SPEEDO.SWEEP);
+    ctx.stroke();
+    ctx.strokeStyle = SPEEDO_COLORS.redline;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.84, angleFor(SPEEDO.REDLINE_KMH), angleFor(SPEEDO.DIAL_MAX_KMH));
+    ctx.stroke();
+
+    // ticks every 20, labelled every 40
+    ctx.font = `600 ${Math.round(R * 0.15)}px 'Courier New', monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let kmh = 0; kmh <= SPEEDO.DIAL_MAX_KMH; kmh += 20) {
+      const a = angleFor(kmh);
+      const major = kmh % 40 === 0;
+      const rOuter = R * 0.76;
+      const rInner = R * (major ? 0.62 : 0.68);
+      ctx.strokeStyle = major ? SPEEDO_COLORS.tick : SPEEDO_COLORS.tickMinor;
+      ctx.lineWidth = major ? R * 0.035 : R * 0.02;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * rInner, cy + Math.sin(a) * rInner);
+      ctx.lineTo(cx + Math.cos(a) * rOuter, cy + Math.sin(a) * rOuter);
+      ctx.stroke();
+      if (major) {
+        ctx.fillStyle = SPEEDO_COLORS.label;
+        ctx.fillText(String(kmh), cx + Math.cos(a) * R * 0.49, cy + Math.sin(a) * R * 0.49);
+      }
+    }
+
+    // needle
+    const na = angleFor(this.needleKmh);
+    ctx.strokeStyle = SPEEDO_COLORS.needle;
+    ctx.lineCap = 'round';
+    ctx.lineWidth = R * 0.045;
+    ctx.beginPath();
+    ctx.moveTo(cx - Math.cos(na) * R * 0.12, cy - Math.sin(na) * R * 0.12);
+    ctx.lineTo(cx + Math.cos(na) * R * 0.72, cy + Math.sin(na) * R * 0.72);
+    ctx.stroke();
+    ctx.fillStyle = SPEEDO_COLORS.needle;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 0.07, 0, Math.PI * 2);
+    ctx.fill();
+
+    // digital readout
+    ctx.fillStyle = SPEEDO_COLORS.readout;
+    ctx.font = `700 ${Math.round(R * 0.30)}px 'Courier New', monospace`;
+    ctx.fillText(String(Math.round(this.needleKmh)), cx, cy + R * 0.34);
+    ctx.fillStyle = SPEEDO_COLORS.unit;
+    ctx.font = `600 ${Math.round(R * 0.13)}px 'Courier New', monospace`;
+    ctx.fillText('km/h', cx, cy + R * 0.57);
+
     ctx.restore();
   },
 };
