@@ -40,7 +40,12 @@ const AI_TUNING = {
   // tight the line is right here. Raise this to cut corners less, at the cost
   // of twitchier steering.
   LOOKAHEAD_CURVE_TIGHTEN: 150,
-  SPEED_LOOKAHEAD: 0.35,  // seconds ahead used when reading the speed profile
+  // Seconds ahead used when reading the speed profile. The profile already
+  // has braking distance baked in, so this is pure safety margin — every
+  // extra tenth here means lifting off that much earlier than necessary.
+  // Dropping it from 0.35 to 0.10 is where most of the bots' late braking
+  // comes from; below about 0.10 there is nothing further to gain.
+  SPEED_LOOKAHEAD: 0.10,
   BRAKE_TOLERANCE: 1.04,  // brake once above target speed by this factor
   SPIN_RECOVERY_ANGLE: 1.25, // rad of heading error before a bot lifts off
   STUCK_SPEED: 28,        // px/s under which a bot is considered stuck
@@ -49,37 +54,44 @@ const AI_TUNING = {
 };
 
 // Three distinct drivers. cornerSpeed is the big one — it scales how close to
-// the theoretical limit they take corners, and so how fast the lap is.
+// the theoretical limit they take corners, and so how fast the lap is. It is
+// a discount on the steering limit implied by the physics constants, so even
+// at ~1.0 a bot is only doing what the player's own car could do; none of
+// these values grant extra grip or a higher top speed.
+//
+// Corner speeds are set so each driver averages almost exactly one second a
+// lap quicker than the previous tuning, with the gaps between them intact:
+//   VOSS 21.293 -> 20.299   RIVA 22.443 -> 21.436   KOSS 23.618 -> 22.583
 const BOT_PROFILES = [
   {
     name: 'VOSS', color: '#4db8ff',
-    cornerSpeed: 0.82,      // quickest through corners
+    cornerSpeed: 0.994,     // quickest through corners, right on the limit
     topSpeed: 1.00,
     brakeDecel: 1150,       // px/s^2 assumed when planning braking points
     lookaheadMul: 1.00,
     steerGain: 3.0,
     lineBias: 0,            // px off the ideal line (+ = driver's right)
-    wander: 4, wanderRate: 0.50,
+    wander: 3, wanderRate: 0.50,
   },
   {
     name: 'RIVA', color: '#ffc94d',
-    cornerSpeed: 0.745,     // roughly a match for a tidy human lap
+    cornerSpeed: 0.849,     // roughly a match for a tidy human lap
     topSpeed: 0.96,
     brakeDecel: 1050,
     lookaheadMul: 1.05,
     steerGain: 2.8,
-    lineBias: 7,
-    wander: 5, wanderRate: 0.37,
+    lineBias: 6,
+    wander: 4, wanderRate: 0.37,
   },
   {
     name: 'KOSS', color: '#7ee081',
-    cornerSpeed: 0.665,     // noticeably slower, brakes early
+    cornerSpeed: 0.751,     // noticeably slower, brakes earlier
     topSpeed: 0.91,
     brakeDecel: 980,
     lookaheadMul: 1.10,
     steerGain: 2.6,
-    lineBias: -8,
-    wander: 6, wanderRate: 0.29,
+    lineBias: -6,
+    wander: 4, wanderRate: 0.29,
   },
 ];
 
@@ -179,7 +191,9 @@ function buildSpeedProfile(line, profile) {
 }
 
 // Shared line geometry; each bot gets its own speed profile over it.
-const RACING_LINE = buildRacingLine(TRACK);
+// Declared with let so the line can be rebuilt if the track or the tuning
+// changes — restart() hands the current line to each new driver.
+let RACING_LINE = buildRacingLine(TRACK);
 
 // ---------------------------------------------------------------------------
 // Helpers

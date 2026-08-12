@@ -43,13 +43,44 @@ const CAMERA = {
   // — which is "70% of the circuit visible" by area — the deadzone is +/-799px
   // against only +/-254px of available travel. 0.50 keeps a real pan range.
   VIEWPORT_FRACTION: 0.50,
-  // Deadzone rectangle as a fraction of the canvas. While the car is inside
-  // it the camera does not move at all.
-  DEADZONE_W: 0.60,
-  DEADZONE_H: 0.60,
+  // Deadzone rectangle as a fraction of the canvas. While the focus point is
+  // inside it the camera does not move at all.
+  DEADZONE_W: 0.35,
+  DEADZONE_H: 0.35,
   // Pan smoothing. Higher = the camera catches up to the deadzone edge
   // faster. Framerate-independent.
   SMOOTHING: 7.0,
+
+  // --- velocity look-ahead ---
+  // The camera doesn't track the car, it tracks a focus point pushed ahead of
+  // the car along its direction of travel. At MAX_SPEED that push is this
+  // fraction of the viewport (per axis, so the wider horizontal axis looks
+  // further ahead); at a standstill it is zero and the car sits centred.
+  //
+  // The deadzone works against this: at a steady speed the focus rides the
+  // deadzone boundary, so the car ends up (lookahead - deadzone_half) behind
+  // the centre. With a 0.35 deadzone that means this has to clear ~0.175
+  // before the car sits back from centre at all.
+  LOOKAHEAD_FRACTION: 0.68,
+  // Look-ahead easing, deliberately slower than the pan smoothing so that
+  // reversing direction swings the view across gently instead of snapping.
+  LOOKAHEAD_SMOOTHING: 2.5,
+  // Backstop: however far forward the focus is pushed, the car itself stays
+  // within this fraction of the viewport from the centre. Only bites during
+  // transients (a hard deceleration leaves the camera briefly ahead of a
+  // still-large look-ahead); the steady-state offset is well inside it.
+  CAR_MAX_OFFSET: 0.82,
+};
+
+// --- Start lights -----------------------------------------------------------
+const LIGHT_COLORS = {
+  housing:   'rgba(16,20,23,0.88)',
+  housingEdge: 'rgba(150,170,185,0.25)',
+  unlit:     '#3a2326',
+  red:       '#ff2d20',
+  redGlow:   'rgba(255,45,32,0.45)',
+  green:     '#41e06a',
+  greenGlow: 'rgba(65,224,106,0.45)',
 };
 
 // --- Kerbs: red/white, corners only, wide stripes so they don't strobe when
@@ -78,6 +109,7 @@ const Render = {
   layerScale: 1,
   view: { scale: 1 },
   camera: { x: 0, y: 0 },
+  look: { x: 0, y: 0 },             // smoothed velocity look-ahead, world px
   viewport: { halfW: 0, halfH: 0 }, // half the visible world size, in world px
 
   init(canvas) {
@@ -114,28 +146,56 @@ const Render = {
   snapCameraTo(track, x, y) {
     this.camera.x = x;
     this.camera.y = y;
+    this.look.x = 0;
+    this.look.y = 0;
     this.clampCamera(track);
   },
 
-  // Deadzone pan: the camera target only changes once the car has pushed past
-  // the deadzone boundary, and then only far enough to hold it on that edge.
+  // Deadzone pan over a look-ahead focus point. The focus sits ahead of the
+  // car in the direction it is travelling; the camera only moves once that
+  // focus leaves the deadzone, and then only far enough to hold it on the
+  // boundary. The car therefore drags the view rather than the view chasing.
   updateCamera(track, car, dt) {
     const cam = this.camera;
     const scale = this.view.scale;
+
+    // --- look-ahead, eased so a change of direction swings across gently ---
+    const speed = Math.hypot(car.vx, car.vy);
+    let wantX = 0, wantY = 0;
+    if (speed > 1e-3) {
+      const frac = Math.min(1, speed / PHYSICS.MAX_SPEED) * CAMERA.LOOKAHEAD_FRACTION;
+      wantX = (car.vx / speed) * frac * this.viewport.halfW;
+      wantY = (car.vy / speed) * frac * this.viewport.halfH;
+    }
+    const lk = 1 - Math.exp(-CAMERA.LOOKAHEAD_SMOOTHING * dt);
+    this.look.x += (wantX - this.look.x) * lk;
+    this.look.y += (wantY - this.look.y) * lk;
+
+    const focusX = car.x + this.look.x;
+    const focusY = car.y + this.look.y;
+
+    // --- deadzone against the focus point ---
     const dzX = this.canvas.width * CAMERA.DEADZONE_W / 2 / scale;  // world px
     const dzY = this.canvas.height * CAMERA.DEADZONE_H / 2 / scale;
 
     let targetX = cam.x, targetY = cam.y;
-    const offX = car.x - cam.x, offY = car.y - cam.y;
-    if (offX > dzX) targetX = car.x - dzX;
-    else if (offX < -dzX) targetX = car.x + dzX;
-    if (offY > dzY) targetY = car.y - dzY;
-    else if (offY < -dzY) targetY = car.y + dzY;
+    const offX = focusX - cam.x, offY = focusY - cam.y;
+    if (offX > dzX) targetX = focusX - dzX;
+    else if (offX < -dzX) targetX = focusX + dzX;
+    if (offY > dzY) targetY = focusY - dzY;
+    else if (offY < -dzY) targetY = focusY + dzY;
 
     const k = 1 - Math.exp(-CAMERA.SMOOTHING * dt); // framerate-independent lerp
     cam.x += (targetX - cam.x) * k;
     cam.y += (targetY - cam.y) * k;
 
+    // --- backstop: keep the car itself comfortably inside the frame ---
+    const maxOffX = this.viewport.halfW * CAMERA.CAR_MAX_OFFSET;
+    const maxOffY = this.viewport.halfH * CAMERA.CAR_MAX_OFFSET;
+    cam.x = clamp(cam.x, car.x - maxOffX, car.x + maxOffX);
+    cam.y = clamp(cam.y, car.y - maxOffY, car.y + maxOffY);
+
+    // Bounds clamping goes last so showing empty space always loses.
     this.clampCamera(track);
   },
 
@@ -371,6 +431,58 @@ const Render = {
     // nose flash so heading is unmistakable at this zoom
     ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.fillRect(w / 2 - 8, -3.5, 6, 7);
+
+    ctx.restore();
+  },
+
+  // ---- start lights (screen space — call outside beginWorld/endWorld) ------
+
+  // lights = { count, litCount, green } — green shows the gantry after lights out.
+  drawStartLights(lights) {
+    const ctx = this.ctx;
+    const W = this.canvas.width;
+    const r = Math.max(9, W * 0.016);          // lamp radius
+    const gap = r * 2.9;                       // lamp spacing
+    const count = lights.count;
+    const panelW = gap * (count - 1) + r * 4;
+    const panelH = r * 3.6;
+    const cx = W / 2;
+    const cy = panelH / 2 + r * 0.9;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.save();
+
+    // housing
+    ctx.fillStyle = LIGHT_COLORS.housing;
+    ctx.strokeStyle = LIGHT_COLORS.housingEdge;
+    ctx.lineWidth = Math.max(1, r * 0.08);
+    ctx.beginPath();
+    ctx.roundRect(cx - panelW / 2, cy - panelH / 2, panelW, panelH, r * 0.6);
+    ctx.fill();
+    ctx.stroke();
+
+    for (let i = 0; i < count; i++) {
+      const x = cx - (gap * (count - 1)) / 2 + i * gap;
+      const lit = lights.green || i < lights.litCount;
+      const color = lights.green ? LIGHT_COLORS.green : LIGHT_COLORS.red;
+      const glow = lights.green ? LIGHT_COLORS.greenGlow : LIGHT_COLORS.redGlow;
+
+      if (lit) {
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(x, cy, r * 1.75, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = lit ? color : LIGHT_COLORS.unlit;
+      ctx.beginPath();
+      ctx.arc(x, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      // a small highlight so an unlit lamp still reads as glass
+      ctx.fillStyle = lit ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.06)';
+      ctx.beginPath();
+      ctx.arc(x - r * 0.3, cy - r * 0.34, r * 0.26, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     ctx.restore();
   },
